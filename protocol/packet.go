@@ -1,24 +1,23 @@
 package protocol
 
 import (
-	"encoding/binary"
-	"errors"
+    "encoding/binary"
+    "errors"
 )
 
 const (
-	PacketData     byte = 1
-	PacketAck      byte = 2
-	PacketBindConn byte = 3
-	PacketFin      byte = 4
+    PacketData byte = 1
+    PacketAck  byte = 2
+    PacketFin  byte = 3
 )
 
 const headerSize = 1 + 8 + 8 + 4 // flag + seq + ack + dataLen
 
 type Packet struct {
-	Flag byte
-	Seq  uint64
-	Ack  uint64
-	Data []byte
+    Flag byte
+    Seq  uint64
+    Ack  uint64
+    Data []byte
 }
 
 // Serialize 序列化（返回一个完整的 []byte）
@@ -69,13 +68,9 @@ func NewDataPacket(seq uint64, data []byte) *Packet {
 }
 
 func NewAckPacket(ack uint64) *Packet {
-	return &Packet{Flag: PacketAck, Ack: ack}
-}
-
-func NewBindConnPacket(uuid []byte) *Packet {
-	return &Packet{Flag: PacketBindConn, Data: uuid}
+    return &Packet{Flag: PacketAck, Ack: ack}
 }
 
 func NewFinPacket() *Packet {
-	return &Packet{Flag: PacketFin}
+    return &Packet{Flag: PacketFin}
 }

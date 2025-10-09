@@ -147,42 +147,31 @@ func NewSession(parent context.Context, cfg SessionConfig) (*Session, error) {
 	}
 	logger = logger.With("session_id", cfg.ID)
 
-	s := &Session{
-		id:          cfg.ID,
-		ctx:         ctx,
-		cancel:      cancel,
-		log:         logger,
-		tcp:         cfg.TCPConn,
-		RequireWS:   make(chan struct{}, 1),
-		Closed:      make(chan struct{}),
-		sendWindow:  make(map[uint64]*Packet),
-		recvBuffer:  make(map[uint64][]byte),
-		windowSlots: make(chan struct{}, cfg.WindowSize),
-		outgoing:    make(chan *Packet, cfg.WindowSize),
-		ackQueue:    make(chan uint64, cfg.WindowSize),
-		resendCh:    make(chan struct{}, 1),
-		sendSeq:     1,
-		expected:    1,
-		srtt:        100 * time.Millisecond,
-		rttvar:      50 * time.Millisecond,
-		rto:         defaultInitialRTO,
-		lastActive:  time.Now(),
-		config:      cfg,
-	}
-	s.wsChanged = make(chan struct{})
-
-	if cfg.InitialWebSocket != nil {
-		s.attachWebSocket(cfg.InitialWebSocket)
-		s.wsMu.Lock()
-		s.ws = cfg.InitialWebSocket
-		s.notifyWebSocketChangeLocked()
-		s.wsMu.Unlock()
-	} else {
-		s.wsMu.Lock()
-		s.notifyWebSocketChangeLocked()
-		s.wsMu.Unlock()
-		s.requestNewWebSocket()
-	}
+    s := &Session{
+        id:          cfg.ID,
+        ctx:         ctx,
+        cancel:      cancel,
+        log:         logger,
+        tcp:         cfg.TCPConn,
+        RequireWS:   make(chan struct{}, 1),
+        Closed:      make(chan struct{}),
+        sendWindow:  make(map[uint64]*Packet),
+        recvBuffer:  make(map[uint64][]byte),
+        windowSlots: make(chan struct{}, cfg.WindowSize),
+        outgoing:    make(chan *Packet, cfg.WindowSize),
+        ackQueue:    make(chan uint64, cfg.WindowSize),
+        resendCh:    make(chan struct{}, 1),
+        sendSeq:     1,
+        expected:    1,
+        srtt:        100 * time.Millisecond,
+        rttvar:      50 * time.Millisecond,
+        rto:         defaultInitialRTO,
+        lastActive:  time.Now(),
+        config:      cfg,
+    }
+    // Initialize change notifier channel once and delegate setup to SetWebSocket
+    s.wsChanged = make(chan struct{})
+    s.SetWebSocket(cfg.InitialWebSocket)
 
 	go s.run()
 	return s, nil
@@ -306,20 +295,21 @@ func (s *Session) invalidateWebSocket(ws *websocket.Conn, err error) {
 
 // tcpReader 负责从本地 TCP 读取数据，转成 DATA 包并放入发送窗口
 func (s *Session) tcpReader(ctx context.Context) error {
-	buf := make([]byte, s.config.ReadBufferSize)
-	for {
-		_ = s.tcp.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
-		n, err := s.tcp.Read(buf)
-		if err != nil {
-			if !isExpectedNetErr(err) {
-				err = fmt.Errorf("tcp read: %w", err)
-			}
-			// Ensure all loops unblock immediately when TCP closes
-			s.Close()
-		}
+    buf := make([]byte, s.config.ReadBufferSize)
+    for {
+        _ = s.tcp.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
+        n, err := s.tcp.Read(buf)
+        if err != nil {
+            if !isExpectedNetErr(err) {
+                err = fmt.Errorf("tcp read: %w", err)
+            }
+            // Close session to immediately unblock wsReader/wsWriter, then return.
+            s.Close()
+            return err
+        }
 
-		data := make([]byte, n)
-		copy(data, buf[:n])
+        data := make([]byte, n)
+        copy(data, buf[:n])
 
 		select {
 		case <-ctx.Done():
