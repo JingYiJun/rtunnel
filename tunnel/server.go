@@ -1,189 +1,264 @@
 package tunnel
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"rtunnel/logging"
 	"rtunnel/protocol"
-    "rtunnel/logging"
 )
 
-// Server 结构体，包含基本的 WSTunnel 和具体的逻辑
+// Server 暴露 WebSocket 端点，将其与目标 TCP 服务之间的数据通过可靠会话转发。
 type Server struct {
 	ListenAddr string
 	TargetAddr string
 	CertFile   string
 	KeyFile    string
 
-	sessions   map[string]*protocol.TCPConnSession
-	sessionsMu sync.RWMutex
-	upgrader   websocket.Upgrader
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	httpServer *http.Server
+
+	sessionsMu sync.Mutex
+	sessions   map[string]*protocol.Session
+
+	wg       sync.WaitGroup
+	stopOnce sync.Once
+
+	log *slog.Logger
 }
 
-// NewServer 创建一个新的服务器
 func NewServer(target, listen string) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		ListenAddr: listen,
 		TargetAddr: target,
-		sessions:   make(map[string]*protocol.TCPConnSession),
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
-		},
+		ctx:        ctx,
+		cancel:     cancel,
+		sessions:   make(map[string]*protocol.Session),
+		log:        logging.Logger().With("component", "server"),
 	}
 }
 
-// Start 启动服务器监听并处理连接
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleRequest)
+	mux.HandleFunc("/", s.handleHTTP)
 
-	server := &http.Server{
-		Addr:    ":" + s.ListenAddr,
-		Handler: mux,
+	s.httpServer = &http.Server{
+		Addr:              s.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		BaseContext:       func(net.Listener) context.Context { return s.ctx },
 	}
 
-	log.Printf("Server listening on :%s, forwarding to %s", s.ListenAddr, s.TargetAddr)
+	go s.cleanupLoop()
 
-	go s.cleanupInactiveSessions()
+	s.log.Info("server started",
+		"listen_addr", s.ListenAddr,
+		"target_addr", s.TargetAddr,
+		"tls_enabled", s.CertFile != "" && s.KeyFile != "",
+	)
 
+	var err error
 	if s.CertFile != "" && s.KeyFile != "" {
-		log.Printf("Using TLS with cert: %s, key: %s", s.CertFile, s.KeyFile)
-		return server.ListenAndServeTLS(s.CertFile, s.KeyFile)
-	}
-
-	return server.ListenAndServe()
-}
-
-// handleRequest 处理HTTP请求，区分静态页面和WebSocket
-func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Upgrade") == "websocket" {
-		sessionID := r.Header.Get("X-Session-ID")
-		switch sessionID {
-		case "":
-			log.Printf("No session ID in request headers")
-			http.Error(w, "Session ID required", http.StatusBadRequest)
-			return
-        case "test-connection":
-            // 处理测试连接请求：升级后启动读循环以便自动响应 Ping
-            wsConn, err := s.upgrader.Upgrade(w, r, nil)
-            if err != nil {
-                log.Printf("Failed to upgrade to WebSocket: %v", err)
-                return
-            }
-            logging.Debugf("WebSocket connection test succeeded")
-            // 默认 PingHandler 会在读取时自动发送 Pong，这里保持一个简单的读循环
-            go func() {
-                defer wsConn.Close()
-                for {
-                    wsConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-                    if _, _, err := wsConn.ReadMessage(); err != nil {
-                        return
-                    }
-                }
-            }()
-            return
-        }
-
-		wsConn, err := s.upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("Failed to upgrade to WebSocket: %v", err)
-			return
-		}
-
-		if err := s.handleSession(sessionID, wsConn); err != nil {
-			log.Printf("[session %s] handle session error: %v", sessionID, err)
-			wsConn.Close()
-		}
-		return
-	}
-
-	s.serveStaticPage(w, r)
-}
-
-// serveStaticPage 提供静态页面服务
-func (s *Server) serveStaticPage(w http.ResponseWriter, r *http.Request) {
-	indexPath := filepath.Join(".", "index.html")
-
-	http.ServeFile(w, r, indexPath)
-}
-
-// handleSession 处理session逻辑
-func (s *Server) handleSession(sessionID string, wsConn *websocket.Conn) error {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
-
-	session, exists := s.sessions[sessionID]
-
-	if !exists {
-		tcpConn, err := net.Dial("tcp", s.TargetAddr)
-		if err != nil {
-			return fmt.Errorf("failed to connect to target %s: %w", s.TargetAddr, err)
-		}
-
-		session = protocol.NewTCPConnSession(sessionID, wsConn, tcpConn)
-		s.sessions[sessionID] = session
-
-		go func() {
-			<-session.Closed
-			s.removeSession(sessionID)
-		}()
-
-		log.Printf("[session %s] created new session", sessionID)
+		err = s.httpServer.ListenAndServeTLS(s.CertFile, s.KeyFile)
 	} else {
-		session.SetWS(wsConn)
-		log.Printf("[session %s] updated WS connection", sessionID)
+		err = s.httpServer.ListenAndServe()
 	}
 
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
 	return nil
 }
 
-// removeSession 从map中移除session
-func (s *Server) removeSession(sessionID string) {
-	s.sessionsMu.Lock()
-	defer s.sessionsMu.Unlock()
+func (s *Server) Stop(ctx context.Context) error {
+	var result error
+	s.stopOnce.Do(func() {
+		s.log.Info("stopping server")
+		s.cancel()
+		if s.httpServer != nil {
+			shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			if err := s.httpServer.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				result = err
+			}
+		}
 
-	if _, exists := s.sessions[sessionID]; exists {
-		delete(s.sessions, sessionID)
-		log.Printf("[session %s] removed from sessions map", sessionID)
+		s.sessionsMu.Lock()
+		for id, session := range s.sessions {
+			s.log.Debug("closing session", "session_id", id)
+			session.Close()
+		}
+		s.sessions = make(map[string]*protocol.Session)
+		s.sessionsMu.Unlock()
+
+		s.wg.Wait()
+	})
+	return result
+}
+
+func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	if !websocket.IsWebSocketUpgrade(r) {
+		s.serveInfo(w, r)
+		return
+	}
+
+	sessionID := r.Header.Get("X-Session-ID")
+	if sessionID == "" {
+		http.Error(w, "missing X-Session-ID header", http.StatusBadRequest)
+		return
+	}
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  32 * 1024,
+		WriteBufferSize: 32 * 1024,
+		CheckOrigin: func(*http.Request) bool {
+			return true
+		},
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		s.log.Error("upgrade failed", "error", err, "remote", r.RemoteAddr)
+		return
+	}
+
+	if sessionID == "myth-chatbot" {
+		s.handleProbe(conn, r.RemoteAddr)
+		return
+	}
+
+	session, fresh, err := s.getOrCreateSession(sessionID)
+	if err != nil {
+		s.log.Error("create session failed", "error", err, "session_id", sessionID)
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()), time.Now().Add(2*time.Second))
+		conn.Close()
+		return
+	}
+
+	session.SetWebSocket(conn)
+	if fresh {
+		s.log.Info("session started", "session_id", sessionID, "client", r.RemoteAddr)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.watchSession(sessionID, session)
+		}()
+	} else {
+		s.log.Debug("websocket reattached", "session_id", sessionID, "client", r.RemoteAddr)
 	}
 }
 
-// cleanupInactiveSessions 定期清理不活跃的session
-func (s *Server) cleanupInactiveSessions() {
+func (s *Server) serveInfo(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "rtunnel server\n")
+	fmt.Fprintf(w, "target: %s\n", s.TargetAddr)
+}
+
+func (s *Server) handleProbe(ws *websocket.Conn, remote string) {
+	defer ws.Close()
+	s.log.Debug("probe connection", "remote", remote)
+	deadline := time.Now().Add(2 * time.Second)
+	_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "probe"), deadline)
+}
+
+func (s *Server) getOrCreateSession(id string) (*protocol.Session, bool, error) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+
+	if session, ok := s.sessions[id]; ok {
+		return session, false, nil
+	}
+
+	conn, err := net.DialTimeout("tcp", s.TargetAddr, 10*time.Second)
+	if err != nil {
+		return nil, false, fmt.Errorf("dial target: %w", err)
+	}
+
+	logger := s.log.With(
+		"session_id", id,
+		"target", s.TargetAddr,
+	)
+
+	session, err := protocol.NewSession(s.ctx, protocol.SessionConfig{
+		ID:      id,
+		TCPConn: conn,
+		Logger:  logger,
+	})
+	if err != nil {
+		conn.Close()
+		return nil, false, err
+	}
+
+	s.sessions[id] = session
+	return session, true, nil
+}
+
+func (s *Server) watchSession(id string, session *protocol.Session) {
+	defer func() {
+		s.sessionsMu.Lock()
+		delete(s.sessions, id)
+		s.sessionsMu.Unlock()
+		session.Close()
+	}()
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			session.Close()
+			return
+		case <-session.Done():
+			if err := session.Err(); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Warn("session ended with error", "session_id", id, "error", err)
+			} else {
+				s.log.Debug("session closed", "session_id", id)
+			}
+			return
+		case <-session.RequireWS:
+			if session.IsClosed() {
+				continue
+			}
+			// Server can only wait for the client to reconnect; record the event once.
+			s.log.Debug("session requires websocket", "session_id", id)
+		}
+	}
+}
+
+func (s *Server) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		s.cleanupStaleSessions()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.cleanupStaleSessions()
+		}
 	}
 }
 
-// cleanupStaleSessions 清理超过5分钟不活跃的session
 func (s *Server) cleanupStaleSessions() {
+	cutoff := time.Now().Add(-10 * time.Minute)
+
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
 
-	timeout := 5 * time.Minute
-
-	for sessionID, session := range s.sessions {
-		select {
-		case <-session.Closed:
-			delete(s.sessions, sessionID)
-			log.Printf("[session %s] removed closed session", sessionID)
-		default:
-			if time.Since(session.GetLastActive()) > timeout {
-				log.Printf("[session %s] cleaning up inactive session", sessionID)
-				session.Close()
-				delete(s.sessions, sessionID)
-			}
+	for id, session := range s.sessions {
+		if session.LastActive().Before(cutoff) {
+			s.log.Info("closing inactive session", "session_id", id)
+			session.Close()
+			delete(s.sessions, id)
 		}
 	}
 }

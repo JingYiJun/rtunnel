@@ -1,31 +1,65 @@
 package logging
 
-import "log"
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"os"
+	"sync"
+)
 
-// Debug controls whether debug-level logs are printed.
-var Debug bool
+var (
+	levelVar   = new(slog.LevelVar)
+	loggerOnce sync.Once
+	baseLogger *slog.Logger
+)
 
-// SetDebug sets the global debug flag.
-func SetDebug(d bool) { Debug = d }
-
-// Debugf prints formatted debug logs when debug is enabled.
-func Debugf(format string, v ...any) {
-    if Debug {
-        log.Printf(format, v...)
-    }
+func init() {
+	levelVar.Set(slog.LevelInfo)
+	initLogger()
 }
 
-// Debugln prints debug logs when debug is enabled.
-func Debugln(v ...any) {
-    if Debug {
-        log.Println(v...)
-    }
+func initLogger() {
+	loggerOnce.Do(func() {
+		baseLogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+			Level:     levelVar,
+			AddSource: false,
+		}))
+	})
 }
 
-// Errorf prints error logs only when debug is enabled.
-// Use for high-frequency errors that should be quiet by default.
-func Errorf(format string, v ...any) {
-    if Debug {
-        log.Printf(format, v...)
-    }
+func Logger() *slog.Logger {
+	initLogger()
+	return baseLogger
+}
+
+func With(args ...any) *slog.Logger {
+	return Logger().With(args...)
+}
+
+func SetDebug(enabled bool) {
+	if enabled {
+		levelVar.Set(slog.LevelDebug)
+	} else {
+		levelVar.Set(slog.LevelInfo)
+	}
+}
+
+func Debugf(format string, args ...any) {
+	log := Logger()
+	if log.Enabled(context.Background(), slog.LevelDebug) {
+		log.Debug(fmt.Sprintf(format, args...))
+	}
+}
+
+func Infof(format string, args ...any) {
+	Logger().Info(fmt.Sprintf(format, args...))
+}
+
+func Warnf(format string, args ...any) {
+	Logger().Warn(fmt.Sprintf(format, args...))
+}
+
+func Errorf(format string, args ...any) {
+	Logger().Error(fmt.Sprintf(format, args...))
 }

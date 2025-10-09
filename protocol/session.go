@@ -314,10 +314,8 @@ func (s *Session) tcpReader(ctx context.Context) error {
 			if !isExpectedNetErr(err) {
 				err = fmt.Errorf("tcp read: %w", err)
 			}
-			return err
-		}
-		if n == 0 {
-			continue
+			// Ensure all loops unblock immediately when TCP closes
+			s.Close()
 		}
 
 		data := make([]byte, n)

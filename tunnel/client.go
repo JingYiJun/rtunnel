@@ -3,230 +3,264 @@ package tunnel
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+
 	"rtunnel/logging"
 	"rtunnel/protocol"
 )
 
+// Client 负责监听本地 TCP 端口，并为每条入站连接与远端服务器建立可靠隧道。
 type Client struct {
-	ListenAddr string
-	URL        string
-	Insecure   bool // 是否跳过TLS证书验证
+	remoteURL  string
+	listenAddr string
+	insecure   bool
 
-	// 会话管理
-	sessions   map[string]*protocol.TCPConnSession
-	sessionsMu sync.RWMutex
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	// 退出控制
+	dialer   *websocket.Dialer
 	listener net.Listener
-	stopCh   chan struct{}
+
+	sessionsMu sync.Mutex
+	sessions   map[string]*protocol.Session
+
+	wg       sync.WaitGroup
 	stopOnce sync.Once
+	stopped  atomic.Bool
+
+	log *slog.Logger
 }
 
-// NewClient 创建一个新的客户端
-func NewClient(url, localPort string, insecure bool) *Client {
-	return &Client{
-		ListenAddr: localPort,
-		URL:        url,
-		Insecure:   insecure,
-		sessions:   make(map[string]*protocol.TCPConnSession),
+func NewClient(remoteURL, listenAddr string, insecure bool) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	dialer := &websocket.Dialer{
+		Proxy:             http.ProxyFromEnvironment,
+		HandshakeTimeout:  15 * time.Second,
+		EnableCompression: false,
 	}
-}
-
-// Start 启动客户端逻辑，监听本地端口并处理连接
-func (c *Client) Start() error {
-	listener, err := net.Listen("tcp", ":"+c.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on port %s: %w", c.ListenAddr, err)
-	}
-	c.listener = listener
-	c.stopCh = make(chan struct{})
-
-	// 启动前测试 WS 连接，失败则直接返回
-	log.Printf("Testing WebSocket connection to %s", c.URL)
-	if err := c.testWSConnection(); err != nil {
-		listener.Close()
-		return fmt.Errorf("WebSocket connection test failed: %w", err)
-	}
-
-	log.Printf("Client listening on :%s, forwarding to %s", c.ListenAddr, c.URL)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if c.isStopped() {
-				log.Printf("Client listener closed; shutting down")
-				return nil
-			}
-			log.Printf("Error accepting connection: %v", err)
-			continue
-		}
-
-		sessionID := uuid.New().String()
-		session := protocol.NewTCPConnSession(sessionID, nil, conn)
-
-		log.Printf("[session %s] New connection from %s", session.ID, conn.RemoteAddr())
-
-		// 记录会话
-		c.sessionsMu.Lock()
-		c.sessions[sessionID] = session
-		c.sessionsMu.Unlock()
-
-		// 会话结束后从 map 中移除
-		go func(id string, s *protocol.TCPConnSession) {
-			<-s.Closed
-			c.sessionsMu.Lock()
-			delete(c.sessions, id)
-			c.sessionsMu.Unlock()
-			log.Printf("[session %s] removed from client session map", id)
-		}(sessionID, session)
-
-		go c.wsManager(session)
-	}
-}
-
-// goroutine为session提供可用的ws连接
-func (c *Client) wsManager(session *protocol.TCPConnSession) {
-	log.Printf("[session %s] wsManager started", session.ID)
-	for {
-		select {
-		case <-session.Closed:
-			log.Printf("[session %s] wsManager exiting: session closed", session.ID)
-			return
-		case <-session.RequireWS:
-
-			for {
-				log.Printf("[session %s] dialing new WS connection...", session.ID)
-				wsConn, err := c.dialWS(session.ID)
-				if err != nil {
-					logging.Errorf("[session %s] failed to dial WS: %v", session.ID, err)
-					time.Sleep(time.Second)
-					continue
-				}
-				session.SetWS(wsConn)
-				break
-			}
-
-			// 上次连接成功后等待1秒，避免瞬间建立多个连接
-			time.Sleep(time.Second)
-			select {
-			case <-session.RequireWS:
-			default:
-			}
-		}
-	}
-}
-
-// dialWS 建立WS连接并在握手时传递UUID
-func (c *Client) dialWS(sessionID string) (*websocket.Conn, error) {
-	dialer := websocket.DefaultDialer
-
-	// 配置TLS选项
-	if c.Insecure {
+	if insecure {
 		dialer.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
 	}
 
-	header := http.Header{}
-	header.Set("X-Session-ID", sessionID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	conn, _, err := dialer.DialContext(ctx, c.URL, header)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial %s: %w", c.URL, err)
+	return &Client{
+		remoteURL:  remoteURL,
+		listenAddr: listenAddr,
+		insecure:   insecure,
+		ctx:        ctx,
+		cancel:     cancel,
+		dialer:     dialer,
+		sessions:   make(map[string]*protocol.Session),
+		log:        logging.Logger().With("component", "client"),
 	}
-
-	return conn, nil
 }
 
-func (c *Client) testWSConnection() error {
-	// 建立 WebSocket 连接
-	timeoutSig := time.After(5 * time.Second)
-	closeSig := make(chan struct{}, 1)
-	wsConn, err := c.dialWS("test-connection")
+func (c *Client) Start() error {
+	listener, err := net.Listen("tcp", c.listenAddr)
 	if err != nil {
-		return err
+		return fmt.Errorf("listen %s: %w", c.listenAddr, err)
 	}
-	defer wsConn.Close()
+	c.listener = listener
 
-	// 启动读取循环以触发 Pong 回调
-	go func() {
-		for {
-			wsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			if _, _, err := wsConn.ReadMessage(); err != nil {
-				return
+	if err := c.probeRemote(); err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("probe remote %s: %w", c.remoteURL, err)
+	}
+
+	c.log.Info("client started",
+		"local_addr", listener.Addr().String(),
+		"remote_url", c.remoteURL,
+		"insecure", c.insecure,
+	)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if c.stopped.Load() {
+				return nil
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("accept: %w", err)
 		}
-	}()
 
-	// 使用 SetPongHandler 处理 Pong 消息并计算 RTT
-	start := time.Now()
-	var rtt time.Duration
-	wsConn.SetPongHandler(func(appData string) error {
-		// 计算 RTT
-		rtt = time.Since(start)
-		log.Printf("Successfully connected to remote server. RTT: %v", rtt)
-		// 关闭连接
-		wsConn.Close()
-		select {
-		case closeSig <- struct{}{}:
-		default:
-		}
-		return nil
-	})
-
-	// 发送一个 Ping 消息
-	if err := wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
-		wsConn.Close()
-		return fmt.Errorf("failed to send ping: %w", err)
-	}
-
-	// 等待 Pong 或 超时
-	select {
-	case <-closeSig:
-		return nil
-	case <-timeoutSig:
-		wsConn.Close()
-		return fmt.Errorf("ping timeout")
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			c.handleConnection(conn)
+		}()
 	}
 }
 
-// Stop 优雅停止客户端：关闭监听器并发送 FIN 关闭所有会话
 func (c *Client) Stop() {
 	c.stopOnce.Do(func() {
-		// 关闭 listener，打断 Accept 阻塞
+		c.stopped.Store(true)
+		c.log.Info("stopping client")
+		c.cancel()
 		if c.listener != nil {
-			c.listener.Close()
+			_ = c.listener.Close()
 		}
-		// 关闭 stopCh
-		close(c.stopCh)
 
-		// 关闭所有会话，触发 FIN
-		c.sessionsMu.RLock()
-		for _, s := range c.sessions {
-			s.Close()
+		c.sessionsMu.Lock()
+		for id, session := range c.sessions {
+			c.log.Debug("closing session", "session_id", id)
+			session.Close()
 		}
-		c.sessionsMu.RUnlock()
+		c.sessions = make(map[string]*protocol.Session)
+		c.sessionsMu.Unlock()
+
+		c.wg.Wait()
 	})
 }
 
-// isStopped 判断是否已触发停止
-func (c *Client) isStopped() bool {
-	select {
-	case <-c.stopCh:
-		return true
-	default:
-		return false
+// handleConnection 针对单个本地连接创建可靠会话，并跟踪生命周期
+func (c *Client) handleConnection(conn net.Conn) {
+	defer conn.Close()
+
+	sessionID := uuid.NewString()
+	logger := c.log.With(
+		"session_id", sessionID,
+		"peer", conn.RemoteAddr().String(),
+	)
+
+	session, err := protocol.NewSession(c.ctx, protocol.SessionConfig{
+		ID:      sessionID,
+		TCPConn: conn,
+		Logger:  logger,
+	})
+	if err != nil {
+		logger.Error("create session failed", "error", err)
+		return
 	}
+
+	c.trackSession(sessionID, session)
+	defer c.untrackSession(sessionID, session)
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.manageWebSocket(sessionID, session, logger)
+	}()
+
+	<-session.Done()
+	if err := session.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		logger.Warn("session ended with error", "error", err)
+	} else {
+		logger.Debug("session closed")
+	}
+}
+
+// manageWebSocket 根据会话的 RequireWS 信号拨号新的 WebSocket 并注入
+func (c *Client) manageWebSocket(id string, session *protocol.Session, logger *slog.Logger) {
+	for {
+		select {
+		case <-c.ctx.Done():
+			session.Close()
+			return
+		case <-session.Done():
+			return
+		case <-session.RequireWS:
+			if session.IsClosed() {
+				return
+			}
+			for {
+				if c.stopped.Load() {
+					session.Close()
+					return
+				}
+				select {
+				case <-c.ctx.Done():
+					session.Close()
+					return
+				case <-session.Done():
+					return
+				default:
+				}
+				ws, err := c.dialWebSocket(id)
+				if err != nil {
+					logger.Warn("dial websocket failed", "error", err)
+					select {
+					case <-time.After(time.Second):
+					case <-c.ctx.Done():
+						session.Close()
+						return
+					}
+					continue
+				}
+				if session.IsClosed() {
+					_ = ws.Close()
+					return
+				}
+				session.SetWebSocket(ws)
+				logger.Debug("websocket established")
+				break
+			}
+		}
+	}
+}
+
+func (c *Client) trackSession(id string, s *protocol.Session) {
+	c.sessionsMu.Lock()
+	c.sessions[id] = s
+	c.sessionsMu.Unlock()
+}
+
+func (c *Client) untrackSession(id string, s *protocol.Session) {
+	c.sessionsMu.Lock()
+	delete(c.sessions, id)
+	c.sessionsMu.Unlock()
+	s.Close()
+}
+
+func (c *Client) dialWebSocket(sessionID string) (*websocket.Conn, error) {
+	header := http.Header{
+		"X-Session-ID": {sessionID},
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
+	defer cancel()
+
+	ws, resp, err := c.dialer.DialContext(ctx, c.remoteURL, header)
+	if err != nil {
+		if resp != nil {
+			return nil, fmt.Errorf("status %d: %w", resp.StatusCode, err)
+		}
+		return nil, err
+	}
+	return ws, nil
+}
+
+func (c *Client) probeRemote() error {
+	ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+	defer cancel()
+
+	ws, resp, err := c.dialer.DialContext(ctx, c.remoteURL, http.Header{
+		"X-Session-ID": {"myth-chatbot"},
+	})
+	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("status %d: %w", resp.StatusCode, err)
+		}
+		return err
+	}
+	defer ws.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	return ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "probe"), deadline)
 }
