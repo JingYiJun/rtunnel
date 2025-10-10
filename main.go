@@ -94,7 +94,7 @@ func runClient(ctx context.Context, opts cliOptions) error {
 
 	client := tunnel.NewClient(remoteURL, localAddr, !opts.secure)
 
-	fmt.Printf("(debug) Starting client...\n")
+	fmt.Printf("Starting client...\n")
 	fmt.Printf("Remote URL: %s\n", remoteURL)
 	fmt.Printf("Local bind: %s\n", localAddr)
 	if opts.secure {
