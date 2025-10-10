@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -169,6 +170,7 @@ func (c *Client) handleConnection(conn net.Conn) {
 
 // manageWebSocket 根据会话的 RequireWS 信号拨号新的 WebSocket 并注入
 func (c *Client) manageWebSocket(id string, session *protocol.Session, logger *slog.Logger) {
+	firstDial := true
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -193,7 +195,7 @@ func (c *Client) manageWebSocket(id string, session *protocol.Session, logger *s
 					return
 				default:
 				}
-				ws, err := c.dialWebSocket(id)
+				ws, err := c.dialWebSocket(id, firstDial)
 				if err != nil {
 					logger.Warn("dial websocket failed", "error", err)
 					select {
@@ -207,6 +209,9 @@ func (c *Client) manageWebSocket(id string, session *protocol.Session, logger *s
 				if session.IsClosed() {
 					_ = ws.Close()
 					return
+				}
+				if firstDial {
+					firstDial = false
 				}
 				session.SetWebSocket(ws)
 				logger.Debug("websocket established")
@@ -229,10 +234,11 @@ func (c *Client) untrackSession(id string, s *protocol.Session) {
 	s.Close()
 }
 
-func (c *Client) dialWebSocket(sessionID string) (*websocket.Conn, error) {
+func (c *Client) dialWebSocket(sessionID string, firstDial bool) (*websocket.Conn, error) {
 	header := http.Header{
 		"X-Session-ID": {sessionID},
 	}
+	header.Set("X-Session-First", strconv.FormatBool(firstDial))
 	ctx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 	defer cancel()
 

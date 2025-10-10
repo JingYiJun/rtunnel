@@ -4,9 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -139,12 +145,37 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session, fresh, err := s.getOrCreateSession(sessionID)
-	if err != nil {
-		s.log.Error("create session failed", "error", err, "session_id", sessionID)
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()), time.Now().Add(2*time.Second))
-		conn.Close()
-		return
+	firstDial := true
+	if raw := strings.TrimSpace(r.Header.Get("X-Session-First")); raw != "" {
+		if v, err := strconv.ParseBool(raw); err == nil {
+			firstDial = v
+		} else {
+			s.log.Debug("invalid X-Session-First header, defaulting to first dial", "value", raw, "session_id", sessionID)
+		}
+	}
+
+	session, exists := s.getSession(sessionID)
+	fresh := false
+	if !exists {
+		if !firstDial {
+			s.log.Debug("rejecting websocket for closed session", "session_id", sessionID, "client", r.RemoteAddr)
+			if err := conn.WriteMessage(websocket.BinaryMessage, protocol.NewFinPacket().Serialize()); err != nil {
+				s.log.Debug("failed to send fin packet", "session_id", sessionID, "error", err)
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "session closed"), deadline)
+			conn.Close()
+			return
+		}
+
+		var err error
+		session, fresh, err = s.getOrCreateSession(sessionID)
+		if err != nil {
+			s.log.Error("create session failed", "error", err, "session_id", sessionID)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()), time.Now().Add(2*time.Second))
+			conn.Close()
+			return
+		}
 	}
 
 	session.SetWebSocket(conn)
@@ -161,8 +192,23 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) serveInfo(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "rtunnel server\n")
-	fmt.Fprintf(w, "target: %s\n", s.TargetAddr)
+	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+		http.NotFound(w, r)
+		return
+	}
+
+	indexPath, err := locateIndexHTML()
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		s.log.Error("serve index failed", "error", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	http.ServeFile(w, r, indexPath)
 }
 
 func (s *Server) handleProbe(ws *websocket.Conn, remote string) {
@@ -170,6 +216,13 @@ func (s *Server) handleProbe(ws *websocket.Conn, remote string) {
 	s.log.Debug("probe connection", "remote", remote)
 	deadline := time.Now().Add(2 * time.Second)
 	_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "probe"), deadline)
+}
+
+func (s *Server) getSession(id string) (*protocol.Session, bool) {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	session, ok := s.sessions[id]
+	return session, ok
 }
 
 func (s *Server) getOrCreateSession(id string) (*protocol.Session, bool, error) {
@@ -261,4 +314,41 @@ func (s *Server) cleanupStaleSessions() {
 			delete(s.sessions, id)
 		}
 	}
+}
+
+func locateIndexHTML() (string, error) {
+	candidates := make([]string, 0, 3)
+
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "index.html"))
+	}
+
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "index.html"))
+	}
+
+	if _, file, _, ok := runtime.Caller(0); ok {
+		candidates = append(candidates, filepath.Join(filepath.Dir(file), "index.html"))
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+	}
+
+	return "", fs.ErrNotExist
 }
