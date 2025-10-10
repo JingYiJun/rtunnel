@@ -94,7 +94,7 @@ func (c *Client) Start() error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}

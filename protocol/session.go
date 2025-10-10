@@ -297,7 +297,6 @@ func (s *Session) invalidateWebSocket(ws *websocket.Conn, err error) {
 func (s *Session) tcpReader(ctx context.Context) error {
     buf := make([]byte, s.config.ReadBufferSize)
     for {
-        _ = s.tcp.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
         n, err := s.tcp.Read(buf)
         if err != nil {
             if !isExpectedNetErr(err) {
@@ -433,18 +432,16 @@ func (s *Session) resendOutstanding(ctx context.Context) error {
 
 // wsReader 负责从 WebSocket 读取 PACKET，并根据类型分发处理
 func (s *Session) wsReader(ctx context.Context) error {
-	for {
-		ws, err := s.waitForWebSocket(ctx)
-		if err != nil {
-			return err
-		}
-
-		ws.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
-		mt, data, err := ws.ReadMessage()
-		if err != nil {
-			if !isExpectedNetErr(err) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
-				err = fmt.Errorf("ws read: %w", err)
-			}
+    for {
+        ws, err := s.waitForWebSocket(ctx)
+        if err != nil {
+            return err
+        }
+        mt, data, err := ws.ReadMessage()
+        if err != nil {
+            if !isExpectedNetErr(err) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+                err = fmt.Errorf("ws read: %w", err)
+            }
 			s.invalidateWebSocket(ws, err)
 			continue
 		}
