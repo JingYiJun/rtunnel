@@ -113,6 +113,8 @@ type Session struct {
 	outgoing    chan *Packet
 	ackQueue    chan uint64
 	resendCh    chan struct{}
+	writerClose chan struct{}
+	writerDone  chan struct{}
 
 	srtt   time.Duration
 	rttvar time.Duration
@@ -147,31 +149,33 @@ func NewSession(parent context.Context, cfg SessionConfig) (*Session, error) {
 	}
 	logger = logger.With("session_id", cfg.ID)
 
-    s := &Session{
-        id:          cfg.ID,
-        ctx:         ctx,
-        cancel:      cancel,
-        log:         logger,
-        tcp:         cfg.TCPConn,
-        RequireWS:   make(chan struct{}, 1),
-        Closed:      make(chan struct{}),
-        sendWindow:  make(map[uint64]*Packet),
-        recvBuffer:  make(map[uint64][]byte),
-        windowSlots: make(chan struct{}, cfg.WindowSize),
-        outgoing:    make(chan *Packet, cfg.WindowSize),
-        ackQueue:    make(chan uint64, cfg.WindowSize),
-        resendCh:    make(chan struct{}, 1),
-        sendSeq:     1,
-        expected:    1,
-        srtt:        100 * time.Millisecond,
-        rttvar:      50 * time.Millisecond,
-        rto:         defaultInitialRTO,
-        lastActive:  time.Now(),
-        config:      cfg,
-    }
-    // Initialize change notifier channel once and delegate setup to SetWebSocket
-    s.wsChanged = make(chan struct{})
-    s.SetWebSocket(cfg.InitialWebSocket)
+	s := &Session{
+		id:          cfg.ID,
+		ctx:         ctx,
+		cancel:      cancel,
+		log:         logger,
+		tcp:         cfg.TCPConn,
+		RequireWS:   make(chan struct{}, 1),
+		Closed:      make(chan struct{}),
+		sendWindow:  make(map[uint64]*Packet),
+		recvBuffer:  make(map[uint64][]byte),
+		windowSlots: make(chan struct{}, cfg.WindowSize),
+		outgoing:    make(chan *Packet, cfg.WindowSize),
+		ackQueue:    make(chan uint64, cfg.WindowSize),
+		resendCh:    make(chan struct{}, 1),
+		writerClose: make(chan struct{}),
+		writerDone:  make(chan struct{}),
+		sendSeq:     1,
+		expected:    1,
+		srtt:        100 * time.Millisecond,
+		rttvar:      50 * time.Millisecond,
+		rto:         defaultInitialRTO,
+		lastActive:  time.Now(),
+		config:      cfg,
+	}
+	// Initialize change notifier channel once and delegate setup to SetWebSocket
+	s.wsChanged = make(chan struct{})
+	s.SetWebSocket(cfg.InitialWebSocket)
 
 	go s.run()
 	return s, nil
@@ -295,20 +299,20 @@ func (s *Session) invalidateWebSocket(ws *websocket.Conn, err error) {
 
 // tcpReader 负责从本地 TCP 读取数据，转成 DATA 包并放入发送窗口
 func (s *Session) tcpReader(ctx context.Context) error {
-    buf := make([]byte, s.config.ReadBufferSize)
-    for {
-        n, err := s.tcp.Read(buf)
-        if err != nil {
-            if !isExpectedNetErr(err) {
-                err = fmt.Errorf("tcp read: %w", err)
-            }
-            // Close session to immediately unblock wsReader/wsWriter, then return.
-            s.Close()
-            return err
-        }
+	buf := make([]byte, s.config.ReadBufferSize)
+	for {
+		n, err := s.tcp.Read(buf)
+		if err != nil {
+			if !isExpectedNetErr(err) {
+				err = fmt.Errorf("tcp read: %w", err)
+			}
+			// Close session to immediately unblock wsReader/wsWriter, then return.
+			s.Close()
+			return err
+		}
 
-        data := make([]byte, n)
-        copy(data, buf[:n])
+		data := make([]byte, n)
+		copy(data, buf[:n])
 
 		select {
 		case <-ctx.Done():
@@ -341,6 +345,8 @@ func (s *Session) tcpReader(ctx context.Context) error {
 // - 定时发送 Ping
 // - 根据 RTO 触发重传
 func (s *Session) wsWriter(ctx context.Context) error {
+	defer close(s.writerDone)
+
 	heartbeat := time.NewTicker(s.config.PingInterval)
 	defer heartbeat.Stop()
 
@@ -365,6 +371,14 @@ func (s *Session) wsWriter(ctx context.Context) error {
 			if err := s.writePing(ctx); err != nil {
 				return err
 			}
+		case <-s.writerClose:
+			if err := s.writePacket(ctx, NewFinPacket()); err != nil &&
+				err != ErrSessionClosed &&
+				!errors.Is(err, context.Canceled) &&
+				!isExpectedNetErr(err) {
+				s.log.Debug("failed to send FIN", "error", err)
+			}
+			return nil
 		}
 	}
 }
@@ -432,16 +446,16 @@ func (s *Session) resendOutstanding(ctx context.Context) error {
 
 // wsReader 负责从 WebSocket 读取 PACKET，并根据类型分发处理
 func (s *Session) wsReader(ctx context.Context) error {
-    for {
-        ws, err := s.waitForWebSocket(ctx)
-        if err != nil {
-            return err
-        }
-        mt, data, err := ws.ReadMessage()
-        if err != nil {
-            if !isExpectedNetErr(err) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
-                err = fmt.Errorf("ws read: %w", err)
-            }
+	for {
+		ws, err := s.waitForWebSocket(ctx)
+		if err != nil {
+			return err
+		}
+		mt, data, err := ws.ReadMessage()
+		if err != nil {
+			if !isExpectedNetErr(err) && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway, websocket.CloseNoStatusReceived) {
+				err = fmt.Errorf("ws read: %w", err)
+			}
 			s.invalidateWebSocket(ws, err)
 			continue
 		}
@@ -678,6 +692,17 @@ func (s *Session) Close() {
 		return
 	}
 
+	if s.writerClose != nil {
+		close(s.writerClose)
+	}
+	if s.writerDone != nil {
+		select {
+		case <-s.writerDone:
+		case <-time.After(2 * time.Second):
+			s.log.Warn("wsWriter did not shut down in time")
+		}
+	}
+
 	s.cancel()
 
 	select {
@@ -688,7 +713,6 @@ func (s *Session) Close() {
 
 	ws := s.getAndClearWebSocket()
 	if ws != nil {
-		_ = ws.WriteMessage(websocket.BinaryMessage, NewFinPacket().Serialize())
 		_ = ws.Close()
 	}
 	_ = s.tcp.Close()
