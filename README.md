@@ -31,6 +31,7 @@
   - 示例：
     - WS：`rtunnel ws://localhost:8080 2222`
     - WSS 验证证书：`rtunnel wss://localhost:8443 2222 --secure`
+    - SSH 代理命令：`ssh -o ProxyCommand='rtunnel ws://server:8080 stdio://%h:%p' user@host`
 
 ## 命令行选项
 - `--secure`, `-s`：
