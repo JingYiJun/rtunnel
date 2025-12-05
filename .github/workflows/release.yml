@@ -1,113 +1,126 @@
 name: Build and Release
 
 on:
-    push:
-        branches:
-            - main
-        tags:
-            - "*"
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
 
 jobs:
-    build:
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-        strategy:
-            matrix:
-                include:
-                    - goos: linux
-                      goarch: amd64
-                      ext: ""
-                      archive: tar.gz
-                    - goos: linux
-                      goarch: arm64
-                      ext: ""
-                      archive: tar.gz
-                    - goos: darwin
-                      goarch: amd64
-                      ext: ""
-                      archive: tar.gz
-                    - goos: darwin
-                      goarch: arm64
-                      ext: ""
-                      archive: tar.gz
-                    - goos: windows
-                      goarch: amd64
-                      ext: .exe
-                      archive: zip
-                    - goos: windows
-                      goarch: arm64
-                      ext: .exe
-                      archive: zip
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            archive: zip
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-            - name: Set up Go
-              uses: actions/setup-go@v5
-              with:
-                  go-version-file: go.mod
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
 
-            - name: Build binary
-              env:
-                  GOOS: ${{ matrix.goos }}
-                  GOARCH: ${{ matrix.goarch }}
-                  CGO_ENABLED: 0
-              run: |
-                  go build -ldflags="-s -w" -o rtunnel${{ matrix.ext }} .
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -o rtunnel${{ matrix.ext }} .
 
-            - name: Create archive
-              shell: bash
-              run: |
-                  if [ "${{ matrix.archive }}" = "tar.gz" ]; then
-                    tar -czf rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }} rtunnel${{ matrix.ext }}
-                  else
-                    zip rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }} rtunnel${{ matrix.ext }}
-                  fi
+      - name: Create archive
+        shell: bash
+        run: |
+          if [ "${{ matrix.archive }}" = "tar.gz" ]; then
+            tar -czf rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }} rtunnel${{ matrix.ext }}
+          else
+            zip rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }} rtunnel${{ matrix.ext }}
+          fi
 
-            - name: Upload artifact
-              uses: actions/upload-artifact@v4
-              with:
-                  name: rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}
-                  path: rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: rtunnel-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.archive }}
 
-    release:
-        needs: build
-        runs-on: ubuntu-latest
-        permissions:
-            contents: write
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-            - name: Determine release tag
-              id: release
-              run: |
-                  if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-                    TAG=${GITHUB_REF#refs/tags/}
-                    echo "tag=$TAG" >> $GITHUB_OUTPUT
-                    echo "is_tag=true" >> $GITHUB_OUTPUT
-                  else
-                    echo "tag=nightly" >> $GITHUB_OUTPUT
-                    echo "is_tag=false" >> $GITHUB_OUTPUT
-                  fi
+      - name: Determine release tag
+        id: release
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "tag=nightly" >> $GITHUB_OUTPUT
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
 
-            - name: Download all artifacts
-              uses: actions/download-artifact@v4
-              with:
-                  path: artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-            - name: Create or update release
-              uses: softprops/action-gh-release@v1
-              with:
-                  tag_name: ${{ steps.release.outputs.tag }}
-                  name: Release ${{ steps.release.outputs.tag }}
-                  files: artifacts/**/*
-                  draft: false
-                  prerelease: false
-                  generate_release_notes: true
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create or update release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Release ${{ steps.release.outputs.tag }}
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create or update latest release (for tag push)
+        if: steps.release.outputs.is_tag == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: latest
+          name: Release latest
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
