@@ -110,6 +110,29 @@ func (c *Client) Start() error {
 	}
 }
 
+// StartStdio 启动 stdio 模式的客户端，直接使用 stdin/stdout 作为连接
+func (c *Client) StartStdio() error {
+	if err := c.probeRemote(); err != nil {
+		return fmt.Errorf("probe remote %s: %w", c.remoteURL, err)
+	}
+
+	c.log.Info("client started (stdio mode)",
+		"remote_url", c.remoteURL,
+		"insecure", c.insecure,
+	)
+
+	conn := NewStdioConn()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.handleConnection(conn)
+	}()
+
+	// 等待会话结束
+	c.wg.Wait()
+	return nil
+}
+
 func (c *Client) Stop() {
 	c.stopOnce.Do(func() {
 		c.stopped.Store(true)

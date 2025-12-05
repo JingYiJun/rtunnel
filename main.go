@@ -67,7 +67,8 @@ func parseFlags() cliOptions {
 		fmt.Fprintf(os.Stderr, "RTunnel - Reliable TCP over WebSocket tunnel\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  Server mode:  rtunnel <target_addr> <listen_addr> [options]\n")
-		fmt.Fprintf(os.Stderr, "  Client mode:  rtunnel <remote_url> <local_addr> [options]\n\n")
+		fmt.Fprintf(os.Stderr, "  Client mode:  rtunnel <remote_url> <local_addr> [options]\n")
+		fmt.Fprintf(os.Stderr, "  Client (stdio): rtunnel <remote_url> stdio://<target_addr> [options]\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nExamples:\n")
@@ -75,6 +76,8 @@ func parseFlags() cliOptions {
 		fmt.Fprintf(os.Stderr, "  Server (HTTPS):  rtunnel localhost:22 0.0.0.0:8443 --cert server.crt --key server.key\n")
 		fmt.Fprintf(os.Stderr, "  Client (WS):     rtunnel ws://localhost:8080 127.0.0.1:2222\n")
 		fmt.Fprintf(os.Stderr, "  Client (WSS):    rtunnel wss://localhost:8443 127.0.0.1:2222 --secure\n")
+		fmt.Fprintf(os.Stderr, "  Client (stdio):  rtunnel ws://localhost:8080 stdio://127.0.0.1:22\n")
+		fmt.Fprintf(os.Stderr, "  SSH ProxyCommand: ssh -o ProxyCommand='rtunnel ws://server:8080 stdio://%%h:%%p' user@host\n")
 	}
 
 	flag.CommandLine.Parse(reorderArgs(os.Args[1:]))
@@ -87,6 +90,46 @@ func runClient(ctx context.Context, opts cliOptions) error {
 	if err != nil {
 		return err
 	}
+
+	// 检测是否为 stdio 模式
+	isStdio := strings.HasPrefix(opts.args[1], "stdio://")
+
+	if isStdio {
+		// stdio 模式：直接使用 stdin/stdout
+		client := tunnel.NewClient(remoteURL, "", !opts.secure)
+
+		fmt.Fprintf(os.Stderr, "Starting client (stdio mode)...\n")
+		fmt.Fprintf(os.Stderr, "Remote URL: %s\n", remoteURL)
+		if opts.secure {
+			fmt.Fprintf(os.Stderr, "TLS verification: enabled\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "TLS verification: disabled (use --secure to enable)\n")
+		}
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- client.StartStdio()
+		}()
+
+		select {
+		case <-ctx.Done():
+			client.Stop()
+			select {
+			case err := <-errCh:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					return err
+				}
+			case <-time.After(5 * time.Second):
+				return errors.New("client shutdown timeout")
+			}
+			return nil
+		case err := <-errCh:
+			client.Stop()
+			return err
+		}
+	}
+
+	// TCP 监听模式
 	localAddr, err := normalizeAddress(opts.args[1], "127.0.0.1")
 	if err != nil {
 		return fmt.Errorf("invalid local address: %w", err)
