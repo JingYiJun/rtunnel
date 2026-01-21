@@ -23,12 +23,17 @@ type cliOptions struct {
 	keyFile  string
 	secure   bool
 	debug    bool
+	quiet    bool
 	args     []string
 }
 
 func main() {
 	opts := parseFlags()
-	logging.SetDebug(opts.debug)
+	if opts.quiet {
+		logging.Disable()
+	} else {
+		logging.SetDebug(opts.debug)
+	}
 
 	if len(opts.args) != 2 {
 		fmt.Fprintf(os.Stderr, "Error: invalid number of arguments\n\n")
@@ -60,8 +65,10 @@ func parseFlags() cliOptions {
 	flag.StringVar(&opts.keyFile, "key", "", "TLS private key file (server mode)")
 	flag.BoolVar(&opts.secure, "secure", false, "Enable secure mode (server: TLS, client: verify certificates)")
 	flag.BoolVar(&opts.debug, "debug", false, "Enable debug logging")
+	flag.BoolVar(&opts.quiet, "quiet", false, "Disable all logging")
 	flag.BoolVar(&opts.secure, "s", false, "Short for --secure")
 	flag.BoolVar(&opts.debug, "d", false, "Short for --debug")
+	flag.BoolVar(&opts.quiet, "q", false, "Short for --quiet")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "RTunnel - Reliable TCP over WebSocket tunnel\n\n")
@@ -98,12 +105,14 @@ func runClient(ctx context.Context, opts cliOptions) error {
 		// stdio 模式：直接使用 stdin/stdout
 		client := tunnel.NewClient(remoteURL, "", !opts.secure)
 
-		fmt.Fprintf(os.Stderr, "Starting client (stdio mode)...\n")
-		fmt.Fprintf(os.Stderr, "Remote URL: %s\n", remoteURL)
-		if opts.secure {
-			fmt.Fprintf(os.Stderr, "TLS verification: enabled\n")
-		} else {
-			fmt.Fprintf(os.Stderr, "TLS verification: disabled (use --secure to enable)\n")
+		if !opts.quiet {
+			fmt.Fprintf(os.Stderr, "Starting client (stdio mode)...\n")
+			fmt.Fprintf(os.Stderr, "Remote URL: %s\n", remoteURL)
+			if opts.secure {
+				fmt.Fprintf(os.Stderr, "TLS verification: enabled\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "TLS verification: disabled (use --secure to enable)\n")
+			}
 		}
 
 		errCh := make(chan error, 1)
@@ -137,13 +146,15 @@ func runClient(ctx context.Context, opts cliOptions) error {
 
 	client := tunnel.NewClient(remoteURL, localAddr, !opts.secure)
 
-	fmt.Printf("Starting client...\n")
-	fmt.Printf("Remote URL: %s\n", remoteURL)
-	fmt.Printf("Local bind: %s\n", localAddr)
-	if opts.secure {
-		fmt.Println("TLS verification: enabled")
-	} else {
-		fmt.Println("TLS verification: disabled (use --secure to enable)")
+	if !opts.quiet {
+		fmt.Printf("Starting client...\n")
+		fmt.Printf("Remote URL: %s\n", remoteURL)
+		fmt.Printf("Local bind: %s\n", localAddr)
+		if opts.secure {
+			fmt.Println("TLS verification: enabled")
+		} else {
+			fmt.Println("TLS verification: disabled (use --secure to enable)")
+		}
 	}
 
 	errCh := make(chan error, 1)
@@ -187,13 +198,15 @@ func runServer(ctx context.Context, opts cliOptions) error {
 	server.CertFile = opts.certFile
 	server.KeyFile = opts.keyFile
 
-	fmt.Printf("Starting server...\n")
-	fmt.Printf("Target: %s\n", targetAddr)
-	fmt.Printf("Listen: %s\n", listenAddr)
-	if opts.certFile != "" && opts.keyFile != "" {
-		fmt.Printf("TLS: enabled (%s, %s)\n", opts.certFile, opts.keyFile)
-	} else {
-		fmt.Println("TLS: disabled (HTTP mode)")
+	if !opts.quiet {
+		fmt.Printf("Starting server...\n")
+		fmt.Printf("Target: %s\n", targetAddr)
+		fmt.Printf("Listen: %s\n", listenAddr)
+		if opts.certFile != "" && opts.keyFile != "" {
+			fmt.Printf("TLS: enabled (%s, %s)\n", opts.certFile, opts.keyFile)
+		} else {
+			fmt.Println("TLS: disabled (HTTP mode)")
+		}
 	}
 
 	errCh := make(chan error, 1)
