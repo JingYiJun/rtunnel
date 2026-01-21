@@ -38,3 +38,7 @@ func SetDebug(enabled bool) {
         levelVar.Set(slog.LevelInfo)
     }
 }
+
+func Disable() {
+    levelVar.Set(slog.Level(100))
+}
