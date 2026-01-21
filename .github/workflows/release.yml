@@ -91,7 +91,7 @@ jobs:
             echo "tag=$TAG" >> $GITHUB_OUTPUT
             echo "is_tag=true" >> $GITHUB_OUTPUT
           else
-            echo "tag=nightly" >> $GITHUB_OUTPUT
+            echo "tag=main" >> $GITHUB_OUTPUT
             echo "is_tag=false" >> $GITHUB_OUTPUT
           fi
 
@@ -112,8 +112,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Create or update latest release (for tag push)
-        if: steps.release.outputs.is_tag == 'true'
+      - name: Create or update latest release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: latest
